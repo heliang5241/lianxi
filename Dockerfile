@@ -1,90 +1,144 @@
-FROM debian:buster-slim
+FROM centos:centos7 as builder
 
-# add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN groupadd -r mysql && useradd -r -g mysql mysql
+ARG YUM_FLAGS_COMMON="-y"
+ARG YUM_FLAGS_DEV="${YUM_FLAGS_COMMON}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends gnupg dirmngr && rm -rf /var/lib/apt/lists/*
+ARG MAJOR_VERSION=3.4
+ARG ZBX_VERSION=${MAJOR_VERSION}.9
+ARG ZBX_SOURCES=svn://svn.zabbix.com/tags/${ZBX_VERSION}/
+ENV ZBX_VERSION=${ZBX_VERSION} ZBX_SOURCES=${ZBX_SOURCES} \
+    ZBX_TYPE=proxy ZBX_DB_TYPE=mysql
 
-# add gosu for easy step-down from root
-# https://github.com/tianon/gosu/releases
-ENV GOSU_VERSION 1.12
-RUN set -eux; \
-	savedAptMark="$(apt-mark showmanual)"; \
-	apt-get update; \
-	apt-get install -y --no-install-recommends ca-certificates wget; \
-	rm -rf /var/lib/apt/lists/*; \
-	dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
-	wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
-	wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
-	gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu; \
-	gpgconf --kill all; \
-	rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc; \
-	apt-mark auto '.*' > /dev/null; \
-	[ -z "$savedAptMark" ] || apt-mark manual $savedAptMark > /dev/null; \
-	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
-	chmod +x /usr/local/bin/gosu; \
-	gosu --version; \
-	gosu nobody true
+RUN yum --quiet makecache && \
+    yum ${YUM_FLAGS_DEV} install \
+            autoconf \
+            automake \
+            gcc \
+            libcurl-devel \
+            libevent-devel \
+            libssh2-devel \
+            libxml2-devel \
+            make \
+            mariadb-devel \
+            net-snmp-devel \
+            OpenIPMI-devel \
+            openldap-devel \
+            subversion \
+            unixODBC-devel && \
+    cd /tmp/ && \
+    svn --quiet export ${ZBX_SOURCES} zabbix-${ZBX_VERSION} && \
+    cd /tmp/zabbix-${ZBX_VERSION} && \
+    zabbix_revision=`svn info ${ZBX_SOURCES} | grep "Last Changed Rev"|awk '{print $4;}'` && \
+    sed -i "s/{ZABBIX_REVISION}/$zabbix_revision/g" include/version.h && \
+    ./bootstrap.sh && \
+    export CFLAGS="-fPIC -pie -Wl,-z,relro -Wl,-z,now" && \
+    ./configure \
+            --datadir=/usr/lib \
+            --libdir=/usr/lib/zabbix \
+            --sysconfdir=/etc/zabbix \
+            --prefix=/usr \
+            --enable-agent \
+            --enable-${ZBX_TYPE} \
+            --with-${ZBX_DB_TYPE} \
+            --with-ldap \
+            --with-libcurl \
+            --with-libxml2 \
+            --with-net-snmp \
+            --with-openipmi \
+            --with-openssl \
+            --with-ssh2 \
+            --with-unixodbc \
+            --enable-ipv6 \
+            --silent && \
+    make -j"$(nproc)" -s dbschema && \
+    make -j"$(nproc)" -s && \
+    cat database/${ZBX_DB_TYPE}/schema.sql > database/${ZBX_DB_TYPE}/create.sql && \
+    gzip database/${ZBX_DB_TYPE}/create.sql
 
-RUN mkdir /docker-entrypoint-initdb.d
+FROM centos:centos7
+LABEL maintainer="Alexey Pustovalov <alexey.pustovalov@zabbix.com>"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-# for MYSQL_RANDOM_ROOT_PASSWORD
-		pwgen \
-# for mysql_ssl_rsa_setup
-		openssl \
-# FATAL ERROR: please install the following Perl modules before executing /usr/local/mysql/scripts/mysql_install_db:
-# File::Basename
-# File::Copy
-# Sys::Hostname
-# Data::Dumper
-		perl \
-# install "xz-utils" for .sql.xz docker-entrypoint-initdb.d files
-		xz-utils \
-	&& rm -rf /var/lib/apt/lists/*
+ARG BUILD_DATE
+ARG VCS_REF
 
-RUN set -ex; \
-# gpg: key 5072E1F5: public key "MySQL Release Engineering <mysql-build@oss.oracle.com>" imported
-	key='A4A9406876FCBD3C456770C88C718D3B5072E1F5'; \
-	export GNUPGHOME="$(mktemp -d)"; \
-	gpg --batch --keyserver ha.pool.sks-keyservers.net --recv-keys "$key"; \
-	gpg --batch --export "$key" > /etc/apt/trusted.gpg.d/mysql.gpg; \
-	gpgconf --kill all; \
-	rm -rf "$GNUPGHOME"; \
-	apt-key list > /dev/null
+ARG YUM_FLAGS_COMMON="-y"
+ARG YUM_FLAGS_PERSISTENT="${YUM_FLAGS_COMMON}"
 
-ENV MYSQL_MAJOR 5.7
-ENV MYSQL_VERSION 5.7.29-1debian10
+ARG MAJOR_VERSION=3.4
+ARG ZBX_VERSION=${MAJOR_VERSION}.15
+ARG ZBX_SOURCES=svn://svn.zabbix.com/tags/${ZBX_VERSION}/
+ENV TERM=xterm MIBDIRS=/usr/share/snmp/mibs:/var/lib/zabbix/mibs MIBS=+ALL \
+    ZBX_VERSION=${ZBX_VERSION} ZBX_SOURCES=${ZBX_SOURCES} \
+    ZBX_TYPE=proxy ZBX_DB_TYPE=mysql ZBX_OPT_TYPE=none
+ENV TINI_VERSION v0.18.0
 
-RUN echo "deb http://repo.mysql.com/apt/debian/ buster mysql-${MYSQL_MAJOR}" > /etc/apt/sources.list.d/mysql.list
+LABEL org.label-schema.name="zabbix-${ZBX_TYPE}-${ZBX_DB_TYPE}-centos" \
+      org.label-schema.vendor="Zabbix LLC" \
+      org.label-schema.url="https://zabbix.com/" \
+      org.label-schema.description="Zabbix ${ZBX_TYPE} with MySQL database support" \
+      org.label-schema.vcs-ref="${VCS_REF}" \
+      org.label-schema.build-date="${BUILD_DATE}" \
+      org.label-schema.schema-version="1.0" \
+      org.label-schema.license="GPL v2.0" \
+      org.label-schema.usage="https://www.zabbix.com/documentation/${MAJOR_VERSION}/manual/installation/containers" \
+      org.label-schema.version="${ZBX_VERSION}" \
+      org.label-schema.vcs-url="${ZBX_SOURCES}" \
+      org.label-schema.docker.cmd="docker run --name zabbix-${ZBX_TYPE}-${ZBX_DB_TYPE} --link mysql-server:mysql --link zabbix-server:zabbix-server -p 10051:10051 -d zabbix-${ZBX_TYPE}-${ZBX_DB_TYPE}:centos-${ZBX_VERSION}"
 
-# the "/var/lib/mysql" stuff here is because the mysql-server postinst doesn't have an explicit way to disable the mysql_install_db codepath besides having a database already "configured" (ie, stuff in /var/lib/mysql/mysql)
-# also, we set debconf keys to make APT a little quieter
-RUN { \
-		echo mysql-community-server mysql-community-server/data-dir select ''; \
-		echo mysql-community-server mysql-community-server/root-pass password ''; \
-		echo mysql-community-server mysql-community-server/re-root-pass password ''; \
-		echo mysql-community-server mysql-community-server/remove-test-db select false; \
-	} | debconf-set-selections \
-	&& apt-get update && apt-get install -y mysql-server="${MYSQL_VERSION}" && rm -rf /var/lib/apt/lists/* \
-	&& rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql /var/run/mysqld \
-	&& chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
-# ensure that /var/run/mysqld (used for socket and lock files) is writable regardless of the UID our mysqld instance ends up having at runtime
-	&& chmod 777 /var/run/mysqld \
-# comment out a few problematic configuration values
-	&& find /etc/mysql/ -name '*.cnf' -print0 \
-		| xargs -0 grep -lZE '^(bind-address|log)' \
-		| xargs -rt -0 sed -Ei 's/^(bind-address|log)/#&/' \
-# don't reverse lookup hostnames, they are usually another container
-	&& echo '[mysqld]\nskip-host-cache\nskip-name-resolve' > /etc/mysql/conf.d/docker.cnf
+STOPSIGNAL SIGTERM
 
-VOLUME /var/lib/mysql
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_${ZBX_TYPE}/zabbix_${ZBX_TYPE} /usr/sbin/zabbix_${ZBX_TYPE}
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_get/zabbix_get /usr/bin/zabbix_get
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/src/zabbix_sender/zabbix_sender /usr/bin/zabbix_sender
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/conf/zabbix_${ZBX_TYPE}.conf /etc/zabbix/zabbix_${ZBX_TYPE}.conf
+COPY --from=builder /tmp/zabbix-${ZBX_VERSION}/database/${ZBX_DB_TYPE}/create.sql.gz /usr/share/doc/zabbix-${ZBX_TYPE}-${ZBX_DB_TYPE}/create.sql.gz
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /sbin/tini
 
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN ln -s usr/local/bin/docker-entrypoint.sh /entrypoint.sh # backwards compat
-ENTRYPOINT ["docker-entrypoint.sh"]
+RUN groupadd --system zabbix && \
+    adduser -r --shell /sbin/nologin \
+            -g zabbix \
+            -d /var/lib/zabbix/ \
+        zabbix && \
+    mkdir -p /etc/zabbix && \
+    mkdir -p /var/lib/zabbix && \
+    mkdir -p /var/lib/zabbix/enc && \
+    mkdir -p /usr/lib/zabbix/externalscripts && \
+    mkdir -p /var/lib/zabbix/mibs && \
+    mkdir -p /var/lib/zabbix/modules && \
+    mkdir -p /var/lib/zabbix/snmptraps && \
+    mkdir -p /var/lib/zabbix/ssh_keys && \
+    mkdir -p /var/lib/zabbix/ssl && \
+    mkdir -p /var/lib/zabbix/ssl/certs && \
+    mkdir -p /var/lib/zabbix/ssl/keys && \
+    mkdir -p /var/lib/zabbix/ssl/ssl_ca && \
+    chown --quiet -R zabbix:root /var/lib/zabbix && \
+    mkdir -p /usr/share/doc/zabbix-${ZBX_TYPE}-${ZBX_DB_TYPE} && \
+    yum ${YUM_FLAGS_COMMON} makecache && \
+    yum ${YUM_FLAGS_PERSISTENT} install http://repo.zabbix.com/non-supported/rhel/7/x86_64/fping-3.10-1.el7.x86_64.rpm && \
+    yum ${YUM_FLAGS_PERSISTENT} install \
+            libcurl \
+            libevent \
+            libxml2 \
+            mariadb \
+            net-snmp-libs \
+            OpenIPMI-libs \
+            openldap \
+            openssl-libs \
+            pcre \
+            unixODBC && \
+    yum ${YUM_FLAGS_PERSISTANT} clean all && \
+    rm -rf /var/cache/yum/ && \
+    chmod +x /sbin/tini
 
-EXPOSE 3306 33060
-CMD ["mysqld"]
+EXPOSE 10051/TCP
+
+WORKDIR /var/lib/zabbix
+
+VOLUME ["/usr/lib/zabbix/externalscripts", "/var/lib/zabbix/enc", "/var/lib/zabbix/modules", "/var/lib/zabbix/snmptraps"]
+VOLUME ["/var/lib/zabbix/ssh_keys", "/var/lib/zabbix/ssl/certs", "/var/lib/zabbix/ssl/keys", "/var/lib/zabbix/ssl/ssl_ca"]
+
+COPY ["docker-entrypoint.sh", "/usr/bin/"]
+
+ENTRYPOINT ["/sbin/tini", "--"]
+
+CMD ["docker-entrypoint.sh"]
